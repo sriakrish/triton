@@ -1,4 +1,5 @@
 #include "TDMUtility.h"
+#include "Dialect/TritonAMDGPU/IR/Dialect.h"
 #include "mlir/Dialect/LLVMIR/ROCDLDialect.h"
 #include "triton/Conversion/TritonGPUToLLVM/Utility.h"
 #include "triton/Dialect/Triton/IR/Utility.h"
@@ -1654,25 +1655,20 @@ LogicalResult emitTDMGatherScatter(
   return success();
 }
 
-SmallVector<Value> emitTDMPrefetch(RewriterBase &rewriter, Location loc,
-                                   ArrayRef<Value> desc,
-                                   ArrayRef<int64_t> blockShape, int numLanes,
-                                   int numWarps, int numCTAs,
-                                   ArrayRef<Value> offset, Value pred,
-                                   Type elementType, Value laneId, Value warpId,
-                                   Value ctaId, bool isSpeculative) {
+SmallVector<Value>
+emitTDMPrefetch(RewriterBase &rewriter, Location loc, ArrayRef<Value> desc,
+                ArrayRef<int64_t> prefetchShape, Attribute issueEncoding,
+                ArrayRef<Value> offset, Value pred, Type elementType,
+                Value laneId, Value warpId, Value ctaId, bool isSpeculative) {
   // TDM prefetch uses the same syntax as a regular load. Each lane can prefetch
   // a different address; hardware aligns to a 256-byte boundary and makes that
-  // 256-byte region available in L2. We distribute the nD tile (blockShape)
-  // across CTAs, warps, and lanes so the whole tile is covered by prefetches.
-  // Speculative prefetches may go out-of-bounds; non-speculative prefetches
-  // need bounds checks. We currently only guard based on the whole tensor
-  // extent, so some prefetched chunks might never be used if masking trims
-  // inner dimensions. To add inner-dimension bounds checks we would need to
-  // expose the CTA offsets from the tensor descriptor, which is currently
-  // directly applied to the base pointer.
+  // 256-byte region available in L2. We distribute the nD tile across CTAs,
+  // warps, and lanes so the whole tile is covered by prefetches.
+  // Speculative prefetches may go out of bounds: hardware drops a prefetch
+  // whose translation is not cached. Non-speculative prefetches walk the page
+  // table, so each coordinate is clamped to its dimension, as TDM loads.
   auto b = TritonLLVMOpBuilder(loc, rewriter);
-  int numDims = blockShape.size();
+  int numDims = prefetchShape.size();
   Type globalPtrTy = ptr_ty(loc.getContext(), 1);
 
   // Decode TDM descriptor to get the base pointer, shape, and strides.
@@ -1689,41 +1685,20 @@ SmallVector<Value> emitTDMPrefetch(RewriterBase &rewriter, Location loc,
     return ret;
   };
 
-  // Apply the passed offsets to the base pointer.
-  Value tileOffset = dot64(offset, tensorStride);
-  auto tilePtr = b.gep(globalPtrTy, elementType, basePtr, tileOffset);
+  SmallVector<Value> lastIndex;
+  for (Value dim : tensorShape)
+    lastIndex.push_back(b.sub(dim, b.i32_val(1)));
 
-  // Calculate the total tensor size for bounds checking.
-  Value linearTensorSize =
-      b.mul(b.zext(i64_ty, tensorShape[0]), tensorStride[0]);
+  int elemPerPrefetch = triton::amdgpu::getTDMPrefetchElems(elementType);
 
-  // Calculate maximum allowed offset from tilePtr before going out of bounds
-  Value maxInBoundsLocalOffset =
-      b.sub(b.sub(linearTensorSize, tileOffset), b.i64_val(1));
-
-  // Prefetches 256 bytes into L2
-  const int bytesPerPrefetch = 256;
-  int elemPerPrefetch =
-      (bytesPerPrefetch * 8) / elementType.getIntOrFloatBitWidth();
-
-  // Scale the block shape by the number of elements per prefetch
-  SmallVector<int64_t> scaledBlockShape(blockShape.begin(), blockShape.end());
-  scaledBlockShape.back() =
-      ceil<int64_t>(scaledBlockShape.back(), elemPerPrefetch);
-
-  // Use the default blocked encoding to unroll the TDM tile
-  auto blockedEnc = triton::gpu::getDefaultBlockedEncoding(
-      loc.getContext(), scaledBlockShape, numWarps, numLanes, numCTAs);
-  auto ll = triton::gpu::toLinearLayout(scaledBlockShape, blockedEnc);
+  // The issue encoding unrolls the TDM tile over registers, lanes, warps and
+  // CTAs.
+  auto ll = triton::gpu::toLinearLayout(prefetchShape, issueEncoding);
 
   auto kRegister = rewriter.getStringAttr("register");
   auto kLane = rewriter.getStringAttr("lane");
   auto kWarp = rewriter.getStringAttr("warp");
   auto kBlock = rewriter.getStringAttr("block");
-
-  // Adjust the inner stride (always 1) to the number of elements per prefetch
-  auto scaledStride = tensorStride;
-  scaledStride.back() = b.i64_val(elemPerPrefetch);
 
   auto baseIndices = applyLinearLayout(loc, rewriter, ll,
                                        {{kRegister, b.i32_val(0)},
@@ -1734,6 +1709,40 @@ SmallVector<Value> emitTDMPrefetch(RewriterBase &rewriter, Location loc,
   constexpr int cacheScope = 8; // (8) = L2 scope
   const int hintValue = cacheScope | static_cast<int>(!isSpeculative);
   IntegerAttr hint = rewriter.getI32IntegerAttr(hintValue);
+
+  auto freeMasks = ll.getFreeVariableMasks();
+  assert(freeMasks.lookup(kRegister) == 0 &&
+         "TDM prefetch issue layout does not repeat registers");
+  auto repeatBits = [&](StringAttr dim, Value id) -> Value {
+    int32_t mask = freeMasks.lookup(dim);
+    return mask == 0 ? Value() : b.and_(id, b.i32_val(mask));
+  };
+  // For pred false and for warps and CTAs that repeat lines, we clamp the
+  // address to the base pointer.
+  Value issue = pred;
+  for (Value idBits : {repeatBits(kWarp, warpId), repeatBits(kBlock, ctaId)})
+    if (idBits)
+      issue = b.and_(issue, b.icmp_eq(idBits, b.i32_val(0)));
+  SmallVector<Value> addrStride;
+  for (Value stride : tensorStride)
+    addrStride.push_back(b.select(issue, stride, b.i64_val(0)));
+
+  Value tileOffset = dot64(offset, tensorStride);
+
+  // Adjust the inner stride (always 1) to the number of elements per prefetch
+  auto scaledStride = tensorStride;
+  scaledStride.back() = b.i64_val(elemPerPrefetch);
+
+  // Speculative prefetches address the tile from the passed offsets.
+  Value tilePtr;
+  SmallVector<Value> addrScaledStride;
+  if (isSpeculative) {
+    tilePtr =
+        b.gep(globalPtrTy, elementType, basePtr, dot64(offset, addrStride));
+    addrScaledStride = addrStride;
+    addrScaledStride.back() =
+        b.select(issue, b.i64_val(elemPerPrefetch), b.i64_val(0));
+  }
 
   // Iterate over each register and emit a prefetch intrinsic
   SmallVector<Value> offsets(ll.getInDimSize(kRegister));
@@ -1749,22 +1758,29 @@ SmallVector<Value> emitTDMPrefetch(RewriterBase &rewriter, Location loc,
       indices.emplace_back(combined);
     }
 
-    // Compute the local offset from tile ptr for this prefetch based on the
-    // computed indices
+    // Offset of this prefetch from the tile start, for the returned offsets.
     Value localOffset = dot64(indices, scaledStride);
-
-    // Mask the prefetch if the offset is out of bounds
-    Value inBounds = b.icmp_sle(localOffset, maxInBoundsLocalOffset);
-    // Only predicate based in inBounds for non-speculative prefetches.
-    Value combinedPred = isSpeculative ? pred : b.and_(pred, inBounds);
-
-    // Predicate and emit prefetch
-    // For OOB/pred we clamp the address to the last valid address
-    Value clampedLocalOffset =
-        b.select(combinedPred, localOffset, maxInBoundsLocalOffset);
-    Value prefetchPtr =
-        b.gep(globalPtrTy, elementType, tilePtr, clampedLocalOffset);
-
+    Value prefetchPtr;
+    Value inBounds = b.true_val();
+    if (isSpeculative) {
+      prefetchPtr = b.gep(globalPtrTy, elementType, tilePtr,
+                          dot64(indices, addrScaledStride));
+    } else {
+      // Element coordinates relative to the descriptor base.
+      SmallVector<Value> coords;
+      for (int d = 0; d < numDims; ++d) {
+        Value local = indices[d];
+        if (d == numDims - 1)
+          local = b.mul(local, b.i32_val(elemPerPrefetch));
+        Value coord = b.add(offset[d], local);
+        // Unsigned compares also catch negative coordinates.
+        inBounds = b.and_(inBounds, b.icmp_ult(coord, tensorShape[d]));
+        coords.push_back(b.umin(coord, lastIndex[d]));
+      }
+      prefetchPtr =
+          b.gep(globalPtrTy, elementType, basePtr, dot64(coords, addrStride));
+    }
+    Value combinedPred = b.and_(pred, inBounds);
     ROCDL::GlobalPrefetchOp::create(rewriter, loc, prefetchPtr, hint, {}, {},
                                     {});
 

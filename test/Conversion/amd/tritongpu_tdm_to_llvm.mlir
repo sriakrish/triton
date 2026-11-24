@@ -193,6 +193,7 @@ module attributes {"ttg.num-ctas" = 16 : i32, "ttg.num-warps" = 4 : i32, ttg.tar
 
 #blocked = #ttg.blocked<{sizePerThread = [1, 8], threadsPerWarp = [4, 8], warpsPerCTA = [4, 1], order = [1, 0]}>
 #shared = #ttg.padded_shared<[32:+4] {order = [1, 0], shape = [64, 64]}>
+#issue1 = #ttg.linear<{register = [], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [0, 0]], warp = [[16, 0], [32, 0]], block = []}>  // 64 lines, one CTA
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32} {
   // CHECK-LABEL: tdm_prefetch_regular
   tt.func public @tdm_prefetch_regular(%arg0: !tt.ptr<f16> {tt.divisibility = 16 : i32}) attributes {noinline = false} {
@@ -203,11 +204,70 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.thr
     %c_pred = arith.constant true
     %0 = tt.make_tensor_descriptor %arg0, [%c_shape, %c_shape], [%c_stride0, %c_stride1] : <f16>, <64x64xf16, #shared>
 
+    // Non-speculative prefetches clamp each coordinate. Speculative prefetches
+    // do not clamp.
+    // CHECK-NOT: llvm.intr.umin{{.*}}i64
+    // CHECK: llvm.intr.umin{{.*}} : (i32, i32) -> i32
+    // CHECK: llvm.intr.umin{{.*}} : (i32, i32) -> i32
+    // CHECK-NOT: llvm.intr.umin{{.*}}i64
     // CHECK: rocdl.global.prefetch %{{.*}}, 9 : !llvm.ptr<1>
     amdg.tdm_prefetch %0[%c_offset, %c_offset], %c_pred, speculative = false : !tt.tensordesc<64x64xf16, #shared>
 
+    // CHECK-NOT: llvm.intr.umin
     // CHECK: rocdl.global.prefetch %{{.*}}, 8 : !llvm.ptr<1>
     amdg.tdm_prefetch %0[%c_offset, %c_offset], %c_pred, speculative = true : !tt.tensordesc<64x64xf16, #shared>
+
+    // CHECK: rocdl.global.prefetch %{{.*}}, 8 : !llvm.ptr<1>
+    %off = amdg.tdm_prefetch %0[%c_offset, %c_offset], %c_pred, speculative = true returnOffsets : !tt.tensordesc<64x64xf16, #shared> -> tensor<64x1xi64, #issue1>
+    tt.return
+  }
+}
+
+// -----
+
+// Prefetch with descriptor CGA. Peers split their panel. The verifier checks
+// each result type against inferReturnTypes.
+#shared1 = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0], CGALayout = [[1, 0], [0, 0]]}>
+#shared2 = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0], CGALayout = [[0, 0], [1, 0]]}>
+#shared3 = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0], CGALayout = [[0, 0], [0, 0]]}>
+#shared4 = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0], CGALayout = [[0, 1], [0, 2]]}>
+#shared5 = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>
+#issue1 = #ttg.linear<{register = [], lane = [[1, 0], [2, 0], [0, 0], [0, 0], [0, 0]], warp = [[4, 0], [8, 0]], block = [[32, 0], [16, 0]]}>  // 64 lines; CTA bit 0 selects the row half
+#issue2 = #ttg.linear<{register = [], lane = [[1, 0], [2, 0], [0, 0], [0, 0], [0, 0]], warp = [[4, 0], [8, 0]], block = [[16, 0], [32, 0]]}>  // 64 lines; 16 per CTA in CTA order
+#issue3 = #ttg.linear<{register = [], lane = [[1, 0], [0, 0], [0, 0], [0, 0], [0, 0]], warp = [[2, 0], [4, 0]], block = [[8, 0], [16, 0]]}>  // 32 lines; 8 per CTA
+#issue4 = #ttg.linear<{register = [], lane = [[0, 0], [0, 0], [0, 0], [0, 0], [0, 0]], warp = [[0, 0], [0, 0]], block = [[1, 0], [2, 0]]}>  // 4 lines; 1 per CTA
+#issue5 = #ttg.linear<{register = [], lane = [[1, 0], [2, 0], [4, 0], [0, 0], [0, 0]], warp = [[8, 0], [16, 0]], block = [[0, 1], [32, 0]]}>  // 64x2 lines; CTA bit 0 takes a column
+module attributes {"ttg.num-ctas" = 4 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx1250", "ttg.threads-per-warp" = 32 : i32} {
+  // CHECK-LABEL: tdm_prefetch_cga
+  tt.func public @tdm_prefetch_cga(%arg0: !tt.ptr<f16> {tt.divisibility = 16 : i32}) {
+    %c_shape = arith.constant 1024 : i32
+    %c_stride0 = arith.constant 1024 : i64
+    %c_stride1 = arith.constant 1 : i64
+    %c0 = arith.constant 0 : i32
+    %true = arith.constant true
+    %desc1 = tt.make_tensor_descriptor %arg0, [%c_shape, %c_shape], [%c_stride0, %c_stride1] : <f16>, <64x128xf16, #shared1>
+    %desc2 = tt.make_tensor_descriptor %arg0, [%c_shape, %c_shape], [%c_stride0, %c_stride1] : <f16>, <64x128xf16, #shared2>
+    %desc3 = tt.make_tensor_descriptor %arg0, [%c_shape, %c_shape], [%c_stride0, %c_stride1] : <f16>, <32x128xf16, #shared3>
+    %desc4 = tt.make_tensor_descriptor %arg0, [%c_shape, %c_shape], [%c_stride0, %c_stride1] : <f16>, <4x128xf16, #shared3>
+    %desc5 = tt.make_tensor_descriptor %arg0, [%c_shape, %c_shape], [%c_stride0, %c_stride1] : <f16>, <64x64xf16, #shared4>
+    %desc6 = tt.make_tensor_descriptor %arg0, [%c_shape, %c_shape], [%c_stride0, %c_stride1] : <f16>, <64x256xf16, #shared4>
+    // CHECK: rocdl.global.prefetch %{{.*}}, 9 : !llvm.ptr<1>
+    %off1 = amdg.tdm_prefetch %desc1[%c0, %c0], %true, speculative = false returnOffsets : !tt.tensordesc<64x128xf16, #shared1> -> tensor<64x1xi64, #issue1>
+    // With the peer bit first, the CTA order is the same as for four peers.
+    // CHECK: rocdl.global.prefetch %{{.*}}, 9 : !llvm.ptr<1>
+    %off2 = amdg.tdm_prefetch %desc2[%c0, %c0], %true, speculative = false returnOffsets : !tt.tensordesc<64x128xf16, #shared2> -> tensor<64x1xi64, #issue2>
+    // CHECK: rocdl.global.prefetch %{{.*}}, 9 : !llvm.ptr<1>
+    %off3 = amdg.tdm_prefetch %desc3[%c0, %c0], %true, speculative = false returnOffsets : !tt.tensordesc<32x128xf16, #shared3> -> tensor<32x1xi64, #issue3>
+    // CHECK: rocdl.global.prefetch %{{.*}}, 9 : !llvm.ptr<1>
+    %off4 = amdg.tdm_prefetch %desc4[%c0, %c0], %true, speculative = false returnOffsets : !tt.tensordesc<4x128xf16, #shared3> -> tensor<4x1xi64, #issue4>
+    // CHECK: rocdl.global.prefetch %{{.*}}, 9 : !llvm.ptr<1>
+    %off5 = amdg.tdm_prefetch %desc5[%c0, %c0], %true, speculative = false returnOffsets : !tt.tensordesc<64x64xf16, #shared4> -> tensor<64x1xi64, #issue2>
+    // CHECK: rocdl.global.prefetch %{{.*}}, 9 : !llvm.ptr<1>
+    %off6 = amdg.tdm_prefetch %desc6[%c0, %c0], %true, speculative = false returnOffsets : !tt.tensordesc<64x256xf16, #shared4> -> tensor<64x2xi64, #issue5>
+    %desc7 = tt.make_tensor_descriptor %arg0, [%c_shape, %c_shape], [%c_stride0, %c_stride1] : <f16>, <64x64xf16, #shared5>
+    // CHECK: rocdl.global.prefetch %{{.*}}, 9 : !llvm.ptr<1>
+    %off7 = amdg.tdm_prefetch %desc7[%c0, %c0], %true, speculative = false returnOffsets : !tt.tensordesc<64x64xf16, #shared5> -> tensor<64x1xi64, #issue2>
+    // CHECK-NOT: rocdl.global.prefetch
     tt.return
   }
 }

@@ -2753,8 +2753,12 @@ def test_tdm_prefetch_offsets(shape, block_shape):
                                range(prefetch_block_shape_3d[2])):
             indices = [x, y, z]
             offset = base + sum(indices[d] * prefetch_strides[d] for d in range(rank))
-            # We only mask at the end of the tensor. Rows are allowed to wrap into the next one
-            cta_ref[flat_offset_idx] = 0 if offset >= inp.numel() else offset
+            # Each coordinate is checked against its own dimension, as TDM loads do.
+            coords = [
+                pid[d] * block_shape[d] + indices[d] * (elems_per_prefetch if d == rank - 1 else 1) for d in range(rank)
+            ]
+            in_bounds = all(coords[d] < shape[d] for d in range(rank))
+            cta_ref[flat_offset_idx] = offset if in_bounds else 0
             flat_offset_idx += 1
         cta_idx += 1
 

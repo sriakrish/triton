@@ -2844,7 +2844,8 @@ struct TDMPrefetchConversion
     auto b = TritonLLVMOpBuilder(loc, rewriter);
 
     auto tdescType = op.getDesc().getType();
-    SmallVector<int64_t> blockShape = llvm::to_vector(tdescType.getShape());
+    SmallVector<int64_t> prefetchShape =
+        triton::amdgpu::getTDMPrefetchShape(tdescType);
     Type elementType =
         getTypeConverter()->convertType(tdescType.getElementType());
     SmallVector<Value> desc =
@@ -2858,11 +2859,12 @@ struct TDMPrefetchConversion
 
     auto [laneId, warpId] = getLaneAndWarpId(rewriter, loc);
     auto ctaId = targetInfo.getClusterCTAId(rewriter, loc);
+    Attribute issueEncoding = triton::amdgpu::getTDMPrefetchIssueEncoding(
+        op.getContext(), tdescType, numWarps, threadsPerWarp, numCTAs);
 
     auto offsets = mlir::LLVM::AMD::emitTDMPrefetch(
-        rewriter, loc, desc, blockShape, threadsPerWarp, numWarps, numCTAs,
-        offset, op.getPred(), elementType, laneId, warpId, ctaId,
-        op.getSpeculative());
+        rewriter, loc, desc, prefetchShape, issueEncoding, offset, op.getPred(),
+        elementType, laneId, warpId, ctaId, op.getSpeculative());
 
     // If the op has no results, just erase it
     if (op->getNumResults() == 0) {

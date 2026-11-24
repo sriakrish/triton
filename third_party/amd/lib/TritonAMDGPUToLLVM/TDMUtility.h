@@ -177,15 +177,16 @@ LogicalResult emitTDMGatherScatter(
 // Emit prefetches for a TDM tile to make it available for an actual load in
 // the future. Data is prefetched cooperatively across all CTAs, warps, and
 // lanes to cover the entire TDM tile.
+// `prefetchShape` is the tile in 256-byte chunks (amdgpu::getTDMPrefetchShape).
+// `issueEncoding` comes from amdgpu::getTDMPrefetchIssueEncoding and maps each
+// thread to the 256-byte chunks it prefetches.
 // Returns the prefetched memory offsets. This should only be used for testing
 // purposes.
-SmallVector<Value> emitTDMPrefetch(RewriterBase &rewriter, Location loc,
-                                   ArrayRef<Value> desc,
-                                   ArrayRef<int64_t> blockShape, int numLanes,
-                                   int numWarps, int numCTAs,
-                                   ArrayRef<Value> offset, Value pred,
-                                   Type elementType, Value laneId, Value warpId,
-                                   Value ctaId, bool isSpeculative);
+SmallVector<Value>
+emitTDMPrefetch(RewriterBase &rewriter, Location loc, ArrayRef<Value> desc,
+                ArrayRef<int64_t> prefetchShape, Attribute issueEncoding,
+                ArrayRef<Value> offset, Value pred, Type elementType,
+                Value laneId, Value warpId, Value ctaId, bool isSpeculative);
 
 } // namespace mlir::LLVM::AMD
 

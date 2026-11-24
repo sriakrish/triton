@@ -165,6 +165,15 @@ LogicalResult verifyTDMDescriptor(Operation *op,
                        descTy.getShape().size())
       return op->emitOpError("TDM descriptor shared layout rank must match "
                              "the descriptor rank");
+    int descCTAs =
+        cast<gpu::LayoutEncodingTrait>(layout)
+            .getCGALayout()
+            .getLinearLayout()
+            .getInDimSize(StringAttr::get(op->getContext(), "block"));
+    int numCTAs = gpu::lookupNumCTAs(op);
+    if (descCTAs != 1 && descCTAs != numCTAs)
+      return op->emitOpError("descriptor CGA layout spans ")
+             << descCTAs << " CTAs, but ttg.num-ctas is " << numCTAs;
   }
   unsigned bitWidth = getIntOrFloatOrPtrBitWidth(descTy.getElementType());
   // The data-size field has two bits and encodes log2(bytes per element).
@@ -2204,6 +2213,115 @@ TypedValue<gpu::MemDescType> ArriveBarrierOp::getBarrier() {
   return getAlloc();
 }
 
+int getTDMPrefetchElems(Type elementType) {
+  // Prefetches 256 bytes into L2
+  const int bytesPerPrefetch = 256;
+  return (bytesPerPrefetch * 8) / getIntOrFloatOrPtrBitWidth(elementType);
+}
+
+SmallVector<int64_t> getTDMPrefetchShape(triton::TensorDescType descType) {
+  SmallVector<int64_t> shape(descType.getShape());
+  shape.back() = ceil<int64_t>(shape.back(),
+                               getTDMPrefetchElems(descType.getElementType()));
+  return shape;
+}
+
+namespace {
+
+// CGA layout over `numCTAs` CTAs for a TDM prefetch of `descType`. Without a
+// shared layout or a CGA layout, every CTA prefetches the whole tile, so all
+// CTAs are peers.
+LinearLayout getTDMPrefetchCGALayout(triton::TensorDescType descType,
+                                     int numCTAs) {
+  MLIRContext *ctx = descType.getContext();
+  auto kBlock = StringAttr::get(ctx, "block");
+  SmallVector<StringAttr> outDims =
+      standardOutDimNames(ctx, descType.getShape().size());
+  if (Attribute layout = descType.getSharedLayout()) {
+    LinearLayout cga = cast<triton::gpu::LayoutEncodingTrait>(layout)
+                           .getCGALayout()
+                           .getLinearLayout();
+    if (cga.getInDimSize(kBlock) == numCTAs)
+      return cga;
+  }
+  return LinearLayout({{kBlock, {}}}, outDims) *
+         LinearLayout::zeros1D(numCTAs, kBlock, outDims.front());
+}
+
+// Cooperative issue layout over the prefetch chunks of `descType`.
+LinearLayout getCooperativePrefetchLayout(MLIRContext *ctx,
+                                          triton::TensorDescType descType,
+                                          int numWarps, int numLanes,
+                                          int numCTAs) {
+  auto kRegister = StringAttr::get(ctx, "register");
+  auto kLane = StringAttr::get(ctx, "lane");
+  auto kWarp = StringAttr::get(ctx, "warp");
+  auto kBlock = StringAttr::get(ctx, "block");
+  auto kPeer = StringAttr::get(ctx, "peer");
+  LinearLayout cga = getTDMPrefetchCGALayout(descType, numCTAs);
+
+  // The panel of one CTA in prefetch chunks. CTAs that split one chunk get
+  // zero CGA bases, so they become peers.
+  SmallVector<int64_t> shape = getTDMPrefetchShape(descType);
+  int rank = shape.size();
+  SmallVector<StringAttr> outDims = standardOutDimNames(ctx, rank);
+  cga = ensureLayoutNotLargerThan(cga, outDims, shape);
+  SmallVector<unsigned> split(cga.getOutDimSizes());
+  SmallVector<int64_t> panel = triton::gpu::getShapePerCTA(split, shape);
+
+  // Spread the chunks of one panel over lanes, warps and registers, and give
+  // each peer a contiguous part. With fewer chunks than threads, lanes repeat
+  // rather than warps.
+  LinearLayout flat = LinearLayout::empty();
+  for (auto [size, dim] : llvm::reverse(llvm::zip(panel, outDims)))
+    flat *= LinearLayout::identity1D(size, kRegister, dim);
+  auto isZero = [](ArrayRef<int32_t> basis) {
+    return llvm::all_of(basis, [](int32_t v) { return v == 0; });
+  };
+  const auto &cgaBases = cga.getBases().lookup(kBlock);
+  int numPeers = 1 << llvm::count_if(cgaBases, isZero);
+  int flatSize = flat.getTotalInDimSize();
+  int peerTake = std::min(numPeers, flatSize);
+  int warpTake = std::min(numWarps, flatSize / peerTake);
+  int laneTake = std::min(numLanes, flatSize / peerTake / warpTake);
+  LinearLayout issue =
+      flat.reshapeIns({{kLane, laneTake},
+                       {kWarp, warpTake},
+                       {kRegister, flatSize / peerTake / warpTake / laneTake},
+                       {kPeer, peerTake}})
+          .resizeInDim(kLane, numLanes)
+          .resizeInDim(kWarp, numWarps)
+          .resizeInDim(kPeer, numPeers)
+          .transposeOuts(outDims);
+
+  // Each CTA prefetches within its own CGA tile, and peers split that tile.
+  // Keep the CTA order of the descriptor CGA layout.
+  LinearLayout peerLayout =
+      issue.renameInDim(kPeer, kBlock) * cga.removeZeroBasesAlongDim(kBlock);
+  std::vector<std::vector<int32_t>> blockPerm;
+  int nextPeer = 0;
+  int nextTile = llvm::Log2_32(numPeers);
+  for (const auto &basis : cgaBases)
+    blockPerm.push_back({1 << (isZero(basis) ? nextPeer++ : nextTile++)});
+  LinearLayout toCGAOrder =
+      LinearLayout::identity1D(issue.getInDimSize(kRegister), kRegister,
+                               kRegister) *
+      LinearLayout::identity1D(numLanes, kLane, kLane) *
+      LinearLayout::identity1D(numWarps, kWarp, kWarp) *
+      LinearLayout({{kBlock, blockPerm}}, {kBlock});
+  return toCGAOrder.compose(peerLayout);
+}
+
+} // namespace
+
+Attribute getTDMPrefetchIssueEncoding(MLIRContext *ctx,
+                                      triton::TensorDescType descType,
+                                      int numWarps, int numLanes, int numCTAs) {
+  return triton::gpu::LinearEncodingAttr::get(
+      ctx,
+      getCooperativePrefetchLayout(ctx, descType, numWarps, numLanes, numCTAs));
+}
+
 LogicalResult TDMPrefetchOp::verify() {
   if (failed(verifyTDMDescriptor(getOperation(), getDesc().getType())))
     return failure();
@@ -2233,8 +2351,6 @@ LogicalResult TDMPrefetchOp::inferReturnTypes(
   }
 
   auto descType = cast<triton::TensorDescType>(ad.getDesc().getType());
-  auto blockShape = descType.getShape();
-  auto elementType = descType.getElementType();
 
   // Lookup the module to get the number of threads per warp, number of warps
   // and number of CTAs
@@ -2257,21 +2373,11 @@ LogicalResult TDMPrefetchOp::inferReturnTypes(
   auto numWarps = triton::gpu::lookupNumWarps(mod);
   auto numCTAs = triton::gpu::TritonGPUDialect::getNumCTAs(mod);
 
-  // Prefetches 256 bytes into L2
-  const int bytesPerPrefetch = 256;
-  int elemPerPrefetch =
-      (bytesPerPrefetch * 8) / getIntOrFloatOrPtrBitWidth(elementType);
-
-  // Scale the block shape by the number of elements per prefetch
-  SmallVector<int64_t> scaledBlockShape(blockShape.begin(), blockShape.end());
-  scaledBlockShape.back() =
-      ceil<int64_t>(scaledBlockShape.back(), elemPerPrefetch);
-
-  // Use the default blocked encoding to unroll the TDM tile
-  auto enc = triton::gpu::getDefaultBlockedEncoding(
-      context, scaledBlockShape, numWarps, threadsPerWarp, numCTAs);
+  auto enc = getTDMPrefetchIssueEncoding(context, descType, numWarps,
+                                         threadsPerWarp, numCTAs);
   IntegerType i64Type = IntegerType::get(context, 64);
-  auto tensorTy = RankedTensorType::get(scaledBlockShape, i64Type, enc);
+  auto tensorTy =
+      RankedTensorType::get(getTDMPrefetchShape(descType), i64Type, enc);
 
   inferredReturnTypes.push_back(tensorTy);
 

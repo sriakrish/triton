@@ -63,6 +63,18 @@ inline int getTensorDescNumDwords(triton::TensorDescType type) {
 FailureOr<triton::LinearLayout> inferScaledUpcastFp4ScaleLayout(
     const triton::LinearLayout &outputLL, ArrayRef<int64_t> scaleShape,
     int64_t axis, function_ref<InFlightDiagnostic()> emitError = nullptr);
+
+/// Number of elements of `elementType` in one 256-byte TDM prefetch.
+int getTDMPrefetchElems(Type elementType);
+
+/// Block shape of a TDM prefetch.
+SmallVector<int64_t> getTDMPrefetchShape(triton::TensorDescType descType);
+
+/// Encoding that maps (register, lane, warp, block) to the prefetch chunk each
+/// thread issues.
+Attribute getTDMPrefetchIssueEncoding(MLIRContext *ctx,
+                                      triton::TensorDescType descType,
+                                      int numWarps, int numLanes, int numCTAs);
 } // namespace mlir::triton::amdgpu
 
 // clang-format off
